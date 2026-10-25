@@ -33,10 +33,12 @@ Usage (run inside the `volsplat` conda env):
 """
 import argparse
 import json
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 def qvec2rotmat(qvec):
@@ -167,6 +169,12 @@ def main():
                     help="Where to write eval index json. Default <out_dir>/eval_index.json")
     ap.add_argument("--pose_scale", type=float, default=1.0,
                     help="Multiply COLMAP translations to match near/far scale")
+    ap.add_argument("--resize", default="360x640",
+                    help="Resize each image to HxW (RE10K expects 360x640) before "
+                         "packing into the .torch. Set to 'none' to keep the "
+                         "original resolution. Normalized intrinsics are unaffected.")
+    ap.add_argument("--jpeg_quality", type=int, default=95,
+                    help="JPEG quality for the re-encoded resized images.")
     ap.add_argument("--require_images", action="store_true",
                     help="Fail if an image file referenced by a pose is missing "
                          "(default: skip frames whose image is absent)")
@@ -195,6 +203,26 @@ def main():
 
     img_subdir = root / (args.images_subdir if args.images_subdir else args.camera)
 
+    # Parse --resize ("HxW" or "none"). RE10K's dataloader expects decoded
+    # images to be exactly (3, 360, 640); it does NOT downscale arbitrary sizes,
+    # so we resize here before packing. Normalized intrinsics are resolution-
+    # independent, so they need no change.
+    resize_hw = None
+    if args.resize and args.resize.lower() != "none":
+        try:
+            rh, rw = (int(v) for v in args.resize.lower().split("x"))
+            resize_hw = (rh, rw)
+        except Exception:
+            raise ValueError(f"--resize must be 'HxW' (e.g. 360x640) or 'none', got {args.resize!r}")
+        src_ratio = W / H
+        dst_ratio = rw / rh
+        if abs(src_ratio - dst_ratio) > 1e-3:
+            print(f"  [WARN] Aspect ratio changes: source {W}x{H} (r={src_ratio:.4f}) "
+                  f"-> {rw}x{rh} (r={dst_ratio:.4f}). Images will be distorted. "
+                  f"Consider cropping instead.")
+        else:
+            print(f"  [INFO] Resizing images {W}x{H} -> {rw}x{rh} (same aspect ratio, no distortion).")
+
     # normalized intrinsics (RE10K convention)
     fx_n, fy_n, cx_n, cy_n = fx / W, fy / H, cx / W, cy / H
 
@@ -215,7 +243,15 @@ def main():
         w2c[:3, 3] *= args.pose_scale
         row[6:18] = w2c.astype(np.float32).reshape(-1)
         cam_rows.append(row)
-        raw = np.frombuffer(img_path.read_bytes(), dtype=np.uint8).copy()
+        if resize_hw is not None:
+            rh, rw = resize_hw
+            img = Image.open(img_path).convert("RGB")
+            img = img.resize((rw, rh), Image.BICUBIC)  # PIL size is (W, H)
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=args.jpeg_quality)
+            raw = np.frombuffer(buf.getvalue(), dtype=np.uint8).copy()
+        else:
+            raw = np.frombuffer(img_path.read_bytes(), dtype=np.uint8).copy()
         img_bytes_list.append(torch.from_numpy(raw))
         ordered_names.append(frame)
 
