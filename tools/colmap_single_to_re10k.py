@@ -92,15 +92,54 @@ def read_images_poses(path, camera_name):
     return entries
 
 
-def pick_indices(n, num_context, num_target):
-    """Spread num_context context frames across [0, n-1]; put num_target
-    targets in the gaps between the first and last context frame."""
+def pick_indices(n, num_context, num_target, context_stride=None, context_start=None):
+    """Select context + target frames for novel-view synthesis.
+
+    Context frames are picked with a SMALL, controllable baseline (not spread
+    across the whole sequence) so neighbouring context views overlap enough for
+    feed-forward reconstruction. The context window spans
+    (num_context-1)*stride frames; target frames are interleaved in the gaps
+    between consecutive context frames.
+
+    Args:
+        n              : number of usable frames.
+        num_context    : how many context views.
+        num_target     : how many target (held-out) views.
+        context_stride : frame gap between adjacent context views. If None,
+                         auto = max(1, (n-1)//(num_context-1)//4) capped so the
+                         window fits, giving a compact baseline.
+        context_start  : first context frame index. If None, the context window
+                         is centred in the sequence.
+    """
     if num_context > n:
         num_context = n
-    ctx = np.linspace(0, n - 1, num_context).round().astype(int).tolist()
+    if num_context <= 1:
+        return list(range(min(n, max(1, num_context)))), []
+
+    # Auto stride: compact baseline. Use a quarter of the "even spread" step,
+    # at least 1, and never so large the window overflows the sequence.
+    if context_stride is None or context_stride <= 0:
+        even_step = max(1, (n - 1) // (num_context - 1))
+        context_stride = max(1, even_step // 4)
+    # Ensure the whole context window fits in the sequence.
+    max_stride = (n - 1) // (num_context - 1)
+    context_stride = max(1, min(context_stride, max_stride))
+
+    span = context_stride * (num_context - 1)  # last - first
+
+    # Centre the context window by default.
+    if context_start is None:
+        context_start = (n - 1 - span) // 2
+    context_start = max(0, min(context_start, n - 1 - span))
+
+    ctx = [context_start + i * context_stride for i in range(num_context)]
     ctx = sorted(set(ctx))
+
+    ctx_set = set(ctx)
     lo, hi = ctx[0], ctx[-1]
-    candidates = [i for i in range(lo + 1, hi) if i not in set(ctx)]
+    candidates = [i for i in range(lo + 1, hi) if i not in ctx_set]
+    if not candidates:
+        return ctx, []
     if num_target >= len(candidates):
         tgt = candidates
     else:
@@ -118,6 +157,12 @@ def main():
     ap.add_argument("--scene_key", default="mid_wide")
     ap.add_argument("--num_context", type=int, default=6)
     ap.add_argument("--num_target", type=int, default=8)
+    ap.add_argument("--context_stride", type=int, default=None,
+                    help="Frame gap between adjacent context views. Smaller = "
+                         "tighter baseline (more overlap). Default: auto-compact.")
+    ap.add_argument("--context_start", type=int, default=None,
+                    help="First context frame index. Default: centre the "
+                         "context window in the sequence.")
     ap.add_argument("--eval_index", default=None,
                     help="Where to write eval index json. Default <out_dir>/eval_index.json")
     ap.add_argument("--pose_scale", type=float, default=1.0,
@@ -198,7 +243,9 @@ def main():
         json.dump({args.scene_key: chunk_name}, f, indent=2)
 
     n = len(ordered_names)
-    ctx, tgt = pick_indices(n, args.num_context, args.num_target)
+    ctx, tgt = pick_indices(n, args.num_context, args.num_target,
+                            context_stride=args.context_stride,
+                            context_start=args.context_start)
     if not tgt:  # too few frames -> degenerate; reuse context as target
         tgt = ctx
         print("  [WARN] Not enough frames for separate targets; "
